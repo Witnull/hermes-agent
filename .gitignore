@@ -323,4 +323,4 @@ native/fts5_cjk/*.so
 
 apps/desktop/.dist-build*
 
-skills/
+no_push/
