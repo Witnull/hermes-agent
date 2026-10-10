@@ -1,25 +1,71 @@
 # ============================================================================
-# Hermes Agent Setup Script (Windows) — THE dev-environment entry point.
+# Hermes Agent Setup Script (Windows) — Portable Drive Patch
 # ============================================================================
 # Sets up the pm-managed development environment from a fresh clone:
-#   1. Stage the pinned uv from pm/lock.json (sha256-verified, into the pm
-#      store slot) - pm needs uv to bootstrap, so it cannot stage uv itself.
-#   2. Use uv to install and locate bootstrap Python, then let uv exit.
-#      Run `python -m pm.cli install` directly so PM can safely replace uv.
-#      PM owns the final interpreter, tool store, and dependency generation.
-#   3. Point you at `.\activate.ps1` - the venv-style way to put the pm env
-#      (PATH + tool vars) into your current session.
+#   1. Read .env to configure portable paths (HERMES_HOME, UV_TOOL_DIR, etc.)
+#   2. Stage pinned uv from pm/lock.json into portable $store
+#   3. Use uv to install Python directly onto F:\ (UV_PYTHON_INSTALL_DIR)
+#   4. Run `python -m pm.cli install`
 # ============================================================================
-# Setup and activation both prepare the isolated test interpreter; installers
-# invoke pm.cli directly and do not select it. -TestExtras overrides coverage.
 param([switch]$RuntimeOnly, [string]$TestExtras = '')
 $ErrorActionPreference = 'Stop'
 
 Write-Host ''
-Write-Host 'Hermes Agent Setup' -ForegroundColor Cyan
+Write-Host 'Hermes Agent Setup (Portable Mode)' -ForegroundColor Cyan
 Write-Host ''
 
 $repo = $PSScriptRoot
+$DriveRoot = Split-Path -Qualifier $repo
+
+# ---------------------------------------------------------------------------
+# 0. Load .env early so HERMES_HOME and UV paths are respected
+# ---------------------------------------------------------------------------
+$envCandidates = @(
+    (Join-Path $repo '.env'),
+    (Join-Path $DriveRoot '.hermes\.env')
+)
+foreach ($ef in $envCandidates) {
+    if (Test-Path $ef) {
+        foreach ($line in Get-Content $ef -Encoding UTF8) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed -or $trimmed.StartsWith('#') -or -not $trimmed.Contains('=')) { continue }
+            $kv = $trimmed -split '=', 2
+            $key = ($kv[0].Trim() -replace '^export\s+', '').Trim()
+            if ($key -in @('UID', 'GID', 'EUID', 'EGID', 'PPID')) { continue }
+            if ($key -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { continue }
+            if ($null -ne [Environment]::GetEnvironmentVariable($key)) { continue }
+            $val = $kv[1].Trim()
+            if ($val -match '^"(.*)"$') { $val = $Matches[1] }
+            elseif ($val -match "^'(.*)'$") { $val = $Matches[1] }
+            [Environment]::SetEnvironmentVariable($key, $val)
+        }
+    }
+}
+
+# Enforce portable fallbacks if not defined in .env
+if (-not $env:HERMES_HOME) {
+    $env:HERMES_HOME = Join-Path $DriveRoot '.hermes'
+}
+if (-not $env:HERMES_RUNTIME_DIR) {
+    $env:HERMES_RUNTIME_DIR = Join-Path $env:HERMES_HOME 'tools'
+}
+if (-not $env:UV_TOOL_DIR) {
+    $env:UV_TOOL_DIR = Join-Path $env:HERMES_HOME 'tools'
+}
+if (-not $env:UV_CACHE_DIR) {
+    $env:UV_CACHE_DIR = Join-Path $env:HERMES_HOME 'cache'
+}
+# Crucial: forces uv python install to stay on F:\ instead of AppData on C:
+if (-not $env:UV_PYTHON_INSTALL_DIR) {
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $env:HERMES_RUNTIME_DIR 'python'
+}
+
+# Ensure directories exist on drive
+New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+New-Item -ItemType Directory -Force -Path $env:HERMES_RUNTIME_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path $env:UV_CACHE_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path $env:UV_PYTHON_INSTALL_DIR | Out-Null
+
 $lockPath = Join-Path $repo 'pm/lock.json'
 if (-not (Test-Path $lockPath)) { throw 'pm/lock.json not found' }
 $lock = Get-Content -Raw $lockPath | ConvertFrom-Json
@@ -29,7 +75,7 @@ $arch = if ($machineArch -eq 'ARM64') { 'arm64' } else { 'x64' }
 $target = "win32-$arch"
 
 # ---------------------------------------------------------------------------
-# Stage the pinned uv from pm/lock.json into the pm store slot
+# Stage the pinned uv from pm/lock.json into the portable pm store slot
 # ---------------------------------------------------------------------------
 $uvPin = $lock.packages.uv
 if (-not $uvPin) { throw 'no uv pin in pm/lock.json' }
@@ -40,14 +86,15 @@ if (-not $artifact) { throw "no uv artifact for $target" }
 $pyPin = $lock.packages.python
 $pyVersion = if ($pyPin) { ($pyPin.version -split '\+')[0] -replace '^(\d+\.\d+).*', '$1' } else { '3.11' }
 
-$store = if ($env:HERMES_RUNTIME_DIR) { $env:HERMES_RUNTIME_DIR } else { Join-Path $HOME '.hermes/tools' }
+# Uses portable HERMES_RUNTIME_DIR on F:\
+$store = $env:HERMES_RUNTIME_DIR
 $entry = Join-Path $store "uv-$($uvPin.version)-$target"
 $uv = Join-Path $entry 'uv.exe'
 
 if (Test-Path $uv) {
     Write-Host ("pinned uv found: " + (& $uv --version)) -ForegroundColor Green
 } else {
-    Write-Host "Staging pinned uv $($uvPin.version) ($target) into the pm store..." -ForegroundColor Cyan
+    Write-Host "Staging pinned uv $($uvPin.version) ($target) into portable store ($store)..." -ForegroundColor Cyan
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-setup-" + [guid]::NewGuid().ToString('n'))
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
@@ -72,22 +119,24 @@ if (Test-Path $uv) {
 }
 
 # ---------------------------------------------------------------------------
-# PM installs the tools, then the venv. On ARM64 PM prepares the compiler and
-# OpenSSL environment for that sync itself (pm/native_build.py), after its own
-# git is published, so every install path builds the same way.
-# Activation trusts the recorded tool digest. A direct setup re-checks it.
+# PM installs tools and dependencies into portable directory
 # ---------------------------------------------------------------------------
 Write-Host 'Installing python + tools + dependencies via pm (hash-verified via uv.lock)...' -ForegroundColor Cyan
+Write-Host "(Runtime directory: $store)" -ForegroundColor Gray
 Write-Host '(first run on a fresh checkout can take 1-5 minutes)'
+
 Push-Location $repo
 try {
     # PM can replace its uv entry only after the bootstrap uv has exited.
-    # A bare version lets uv pick emulated x86_64 on Windows-on-ARM.
     $pyRequest = "cpython-$pyVersion-windows-$(if ($arch -eq 'arm64') { 'aarch64' } else { 'x86_64' })-none"
+    
+    # uv python install will now target UV_PYTHON_INSTALL_DIR ($env:HERMES_HOME\tools\python)
     & $uv python install --no-bin --no-registry $pyRequest
     if ($LASTEXITCODE -ne 0) { throw 'bootstrap Python installation failed' }
+    
     $bootPy = (& $uv python find --managed-python $pyRequest) -join "`n"
     if ($LASTEXITCODE -ne 0 -or -not $bootPy) { throw 'bootstrap Python lookup failed' }
+    
     & $bootPy.Trim() -m pm.cli install $(if ($RuntimeOnly) { '--trust-recorded' }) "--test-environment=$TestExtras"
     if ($LASTEXITCODE -ne 0) { throw 'pm install failed - see output above.' }
 } finally {
@@ -111,9 +160,9 @@ if (-not (Test-Path $envFile)) {
 }
 
 # ---------------------------------------------------------------------------
-# Seed bundled skills into ~/.hermes/skills/
+# Seed bundled skills into F:\.hermes\skills\
 # ---------------------------------------------------------------------------
-$skillsDir = if ($env:HERMES_HOME) { Join-Path $env:HERMES_HOME 'skills' } else { Join-Path $HOME '.hermes/skills' }
+$skillsDir = Join-Path $env:HERMES_HOME 'skills'
 New-Item -ItemType Directory -Force -Path $skillsDir | Out-Null
 $sync = Join-Path $repo 'tools/skills_sync.py'
 $venvPy = Join-Path $repo 'venv/Scripts/python.exe'
@@ -126,11 +175,11 @@ if ((Test-Path $sync) -and (Test-Path $venvPy)) {
 # Done
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host 'Setup complete!' -ForegroundColor Green
+Write-Host 'Setup complete! (All binaries & runtime isolated to drive F:)' -ForegroundColor Green
 Write-Host ''
 Write-Host 'Next steps:'
 Write-Host ''
-Write-Host '  1. Activate the dev environment (venv-style, in THIS session):'
+Write-Host '  1. Activate the dev environment (in THIS session):'
 Write-Host '     .\activate.ps1'
 Write-Host ''
 Write-Host '  2. Run the setup wizard to configure API keys:'
@@ -138,10 +187,4 @@ Write-Host '     hermes setup'
 Write-Host ''
 Write-Host '  3. Start chatting:'
 Write-Host '     hermes'
-Write-Host ''
-Write-Host 'Other commands:'
-Write-Host '  hermes pm install     # Re-run the tool + dependency install'
-Write-Host '  hermes status         # Check configuration'
-Write-Host '  hermes doctor         # Diagnose issues'
-Write-Host '  deactivate            # Undo the activation (restore PATH etc.)'
 Write-Host ''
