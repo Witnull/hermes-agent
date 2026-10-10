@@ -133,8 +133,17 @@ try {
     # uv python install will now target UV_PYTHON_INSTALL_DIR ($env:HERMES_HOME\tools\python)
     & $uv python install --no-bin --no-registry $pyRequest
     if ($LASTEXITCODE -ne 0) { throw 'bootstrap Python installation failed' }
-    
+    # Like scripts/install.ps1, decode uv's UTF-8 path independently of the
+    # caller's console code page. Keep this scope local: install.ps1 must also
+    # work as a standalone download before a checkout (and shared files) exists.
+    $previousNativeOutputEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        
     $bootPy = (& $uv python find --managed-python $pyRequest) -join "`n"
+    } finally {
+        [Console]::OutputEncoding = $previousNativeOutputEncoding
+    }
     if ($LASTEXITCODE -ne 0 -or -not $bootPy) { throw 'bootstrap Python lookup failed' }
     
     & $bootPy.Trim() -m pm.cli install $(if ($RuntimeOnly) { '--trust-recorded' }) "--test-environment=$TestExtras"
