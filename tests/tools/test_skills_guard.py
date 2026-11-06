@@ -411,6 +411,25 @@ class TestScanSkillCached:
         assert prov_second["fresh"] is False
         assert second.verdict == first.verdict == "safe"
 
+    def test_cached_trust_follows_current_trusted_repos(self, tmp_path, monkeypatch):
+        """A repo joining or leaving TRUSTED_REPOS re-scans unchanged content under the new trust level
+        instead of serving the trust the cache recorded (a stale 'trusted' would loosen install policy)."""
+        from tools import skills_guard
+
+        skill_dir = tmp_path / "vendor-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("# Vendor\nNothing to see.\n", encoding="utf-8")
+        source = "acme/skills/vendor-skill"
+
+        monkeypatch.setattr(skills_guard, "TRUSTED_REPOS", {"acme/skills"})
+        first, _ = skills_guard.scan_skill_cached(skill_dir, source=source, cache_dir=tmp_path / "cache")
+        assert first.trust_level == "trusted"
+
+        monkeypatch.setattr(skills_guard, "TRUSTED_REPOS", set())
+        second, prov = skills_guard.scan_skill_cached(skill_dir, source=source, cache_dir=tmp_path / "cache")
+        assert prov["fresh"] is True
+        assert second.trust_level == "community"
+
 
 # ---------------------------------------------------------------------------
 # scan_skill — directory scanning
@@ -585,6 +604,8 @@ _INDEX_BENIGN = {
     "diagnosis_guidance": "Do not tell the user that diagnosis requires a rebuild.",
     "sudo_in_docs": "- Amazon Linux 2: `sudo yum install -y postgresql`",
     "bind_all_in_docs": 'CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]',
+    "rm_jsonc_comment": '"rm -rf *": "deny", // Block recursive deletes',
+    "rm_trailing_js_comment": "rm -rf node_modules dist // clean",
 }
 _INDEX_ADVERSARIAL = {
     "real_aws_key": 'aws_access_key_id="' + _AKIA + 'Q3EXAMPLEKEY7ABC"',
@@ -594,6 +615,8 @@ _INDEX_ADVERSARIAL = {
     "rm_apt_lists_escape": "rm -rf /var/lib/apt/lists/../../..",
     "rm_apt_lists_then_etc": "rm -rf /var/lib/apt/lists/* /etc",
     "rm_apt_lookalike": "rm -rf /var/lib/apt/listsX",
+    "rm_double_slash_root": "rm -rf //",
+    "rm_root_after_comment_token": "rm -rf build // /etc",
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
