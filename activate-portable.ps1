@@ -6,6 +6,8 @@
 param([string]$TestExtras = '')
 $ErrorActionPreference = 'Stop'
 
+Import-Module Microsoft.PowerShell.Utility -ErrorAction SilentlyContinue
+
 $repo = $PSScriptRoot
 $driveRoot = Split-Path -Qualifier $repo
 
